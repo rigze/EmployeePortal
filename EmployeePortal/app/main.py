@@ -7,7 +7,7 @@ import json
 from datetime import datetime
 
 # Import from our new files
-from . import models, schemas, auth, database
+from . import models, schemas, auth, database, captcha
 from .database import engine, get_db
 
 # Create Tables (New Schema)
@@ -24,13 +24,25 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# --- NEW AUTH ENDPOINTS ---
+# --- CAPTCHA ENDPOINT ---
+
+@app.get("/api/captcha")
+async def get_captcha():
+    """Generate a new CAPTCHA image"""
+    return captcha.create_captcha()
+
+
+# --- AUTH ENDPOINTS ---
 
 @app.post("/api/auth/login")
 async def login(data: schemas.LoginRequest, db: Session = Depends(get_db)):
-    # 1. CAPTCHA CHECK (Mock)
-    if data.captcha and data.captcha.lower() == "invalid":
-        return {"success": False, "message": "Invalid Captcha"}
+    # 1. CAPTCHA CHECK
+    if data.captcha_id and data.captcha_text:
+        if not captcha.verify_captcha(data.captcha_id, data.captcha_text):
+            return {"success": False, "message": "Invalid CAPTCHA"}
+    elif data.captcha_id or data.captcha_text:
+        # Partial CAPTCHA data provided
+        return {"success": False, "message": "CAPTCHA verification required"}
 
     # 2. FIND USER
     user = db.query(models.UserModel).filter(models.UserModel.employee_id == data.employee_id).first()

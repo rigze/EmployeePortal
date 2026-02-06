@@ -10,8 +10,10 @@ class Token(BaseModel):
 
 class LoginRequest(BaseModel):
     employee_id: str
-    password: Optional[str] = None # Made optional for OTP-only flow
-    captcha: Optional[str] = None
+    password: Optional[str] = None  # Made optional for OTP-only flow
+    captcha_id: Optional[str] = None  # CAPTCHA session ID
+    captcha_text: Optional[str] = None  # User's CAPTCHA input
+
 
 
 class LoginResponse(BaseModel):
