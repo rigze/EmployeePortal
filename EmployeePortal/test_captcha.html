@@ -1,0 +1,225 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>CAPTCHA Test Page</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+            min-height: 100vh;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            color: #fff;
+        }
+        .container {
+            background: rgba(255, 255, 255, 0.05);
+            backdrop-filter: blur(10px);
+            border-radius: 20px;
+            padding: 40px;
+            box-shadow: 0 8px 32px rgba(0, 0, 0, 0.3);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            width: 400px;
+        }
+        h1 {
+            text-align: center;
+            margin-bottom: 30px;
+            font-size: 24px;
+            background: linear-gradient(90deg, #00d2ff, #3a7bd5);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+        }
+        .captcha-box {
+            background: #fff;
+            border-radius: 10px;
+            padding: 10px;
+            margin-bottom: 20px;
+            text-align: center;
+        }
+        .captcha-box img {
+            max-width: 100%;
+            border-radius: 5px;
+        }
+        .refresh-btn {
+            background: linear-gradient(90deg, #00d2ff, #3a7bd5);
+            border: none;
+            color: white;
+            padding: 12px 25px;
+            border-radius: 25px;
+            cursor: pointer;
+            font-size: 14px;
+            transition: transform 0.2s, box-shadow 0.2s;
+            display: block;
+            margin: 0 auto 20px;
+        }
+        .refresh-btn:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 5px 20px rgba(0, 210, 255, 0.4);
+        }
+        .form-group {
+            margin-bottom: 20px;
+        }
+        label {
+            display: block;
+            margin-bottom: 8px;
+            font-size: 14px;
+            color: #aaa;
+        }
+        input {
+            width: 100%;
+            padding: 15px;
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            border-radius: 10px;
+            background: rgba(255, 255, 255, 0.05);
+            color: #fff;
+            font-size: 16px;
+            transition: border-color 0.3s;
+        }
+        input:focus {
+            outline: none;
+            border-color: #00d2ff;
+        }
+        .submit-btn {
+            width: 100%;
+            background: linear-gradient(90deg, #11998e, #38ef7d);
+            border: none;
+            color: white;
+            padding: 15px;
+            border-radius: 10px;
+            cursor: pointer;
+            font-size: 16px;
+            font-weight: bold;
+            transition: transform 0.2s, box-shadow 0.2s;
+        }
+        .submit-btn:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 5px 20px rgba(56, 239, 125, 0.4);
+        }
+        .message {
+            margin-top: 20px;
+            padding: 15px;
+            border-radius: 10px;
+            text-align: center;
+            display: none;
+        }
+        .success {
+            background: rgba(56, 239, 125, 0.2);
+            border: 1px solid #38ef7d;
+            display: block;
+        }
+        .error {
+            background: rgba(255, 71, 87, 0.2);
+            border: 1px solid #ff4757;
+            display: block;
+        }
+        .captcha-id {
+            font-size: 12px;
+            color: #666;
+            margin-top: 10px;
+            word-break: break-all;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🔐 CAPTCHA Test</h1>
+        
+        <div class="captcha-box">
+            <img id="captchaImage" src="" alt="CAPTCHA Image">
+            <div class="captcha-id" id="captchaId"></div>
+        </div>
+        
+        <button class="refresh-btn" onclick="loadCaptcha()">🔄 Refresh CAPTCHA</button>
+        
+        <form id="loginForm">
+            <div class="form-group">
+                <label>Employee ID</label>
+                <input type="text" id="employeeId" placeholder="Enter Employee ID" value="CPF12345">
+            </div>
+            
+            <div class="form-group">
+                <label>Password</label>
+                <input type="password" id="password" placeholder="Enter Password" value="passCPF">
+            </div>
+            
+            <div class="form-group">
+                <label>Enter CAPTCHA Text</label>
+                <input type="text" id="captchaText" placeholder="Type what you see above">
+            </div>
+            
+            <button type="submit" class="submit-btn">Login</button>
+        </form>
+        
+        <div class="message" id="message"></div>
+    </div>
+
+    <script>
+        // API Base URL - Change this to match your server
+        const API_BASE = 'http://localhost:8000';
+        let currentCaptchaId = '';
+
+        async function loadCaptcha() {
+            try {
+                const response = await fetch(`${API_BASE}/api/captcha`);
+                const data = await response.json();
+                
+                document.getElementById('captchaImage').src = data.image;
+                document.getElementById('captchaId').textContent = `ID: ${data.captcha_id}`;
+                currentCaptchaId = data.captcha_id;
+            } catch (error) {
+                console.error('Failed to load CAPTCHA:', error);
+                document.getElementById('captchaId').textContent = 'Failed to load CAPTCHA. Is server running?';
+            }
+        }
+
+        document.getElementById('loginForm').addEventListener('submit', async (e) => {
+            e.preventDefault();
+            
+            const employeeId = document.getElementById('employeeId').value;
+            const password = document.getElementById('password').value;
+            const captchaText = document.getElementById('captchaText').value;
+            
+            try {
+                const response = await fetch(`${API_BASE}/api/auth/login`, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({
+                        employee_id: employeeId,
+                        password: password,
+                        captcha_id: currentCaptchaId,
+                        captcha_text: captchaText
+                    })
+                });
+                
+                const data = await response.json();
+                const messageDiv = document.getElementById('message');
+                
+                if (data.success) {
+                    messageDiv.className = 'message success';
+                    messageDiv.textContent = `✅ ${data.message}. OTP: ${data.dev_hint_otp || 'Check console'}`;
+                } else {
+                    messageDiv.className = 'message error';
+                    messageDiv.textContent = `❌ ${data.message}`;
+                    loadCaptcha(); // Refresh CAPTCHA on failure
+                }
+            } catch (error) {
+                console.error('Login failed:', error);
+                document.getElementById('message').className = 'message error';
+                document.getElementById('message').textContent = '❌ Connection failed. Is server running?';
+            }
+        });
+
+        // Load CAPTCHA on page load
+        loadCaptcha();
+    </script>
+</body>
+</html>

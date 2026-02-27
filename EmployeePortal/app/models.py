@@ -10,6 +10,8 @@ class UserModel(Base):
     # Employee ID with support for special chars like 'GOV/EMP/001'
     employee_id = Column(String(50), primary_key=True, index=True)
     password = Column(String(255)) # Storing raw/hashed password
+    phone_number = Column(String(15), nullable=True)  # Mobile number for OTP SMS
+    email = Column(String(100), nullable=True)  # Email for OTP delivery
     
     # OTP fields
     otp_code = Column(String(10), nullable=True)

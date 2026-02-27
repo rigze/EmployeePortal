@@ -2,15 +2,14 @@ from fastapi import FastAPI, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 from fastapi.middleware.cors import CORSMiddleware
 from typing import List, Optional
-import random
 import json
 from datetime import datetime
 
-# Import from our new files
-from . import models, schemas, auth, database, captcha
+# Import from our modules
+from . import models, schemas, captcha, otp_service, data_service
 from .database import engine, get_db
 
-# Create Tables (New Schema)
+# Create Tables
 models.Base.metadata.create_all(bind=engine)
 
 app = FastAPI()
@@ -41,55 +40,52 @@ async def login(data: schemas.LoginRequest, db: Session = Depends(get_db)):
         if not captcha.verify_captcha(data.captcha_id, data.captcha_text):
             return {"success": False, "message": "Invalid CAPTCHA"}
     elif data.captcha_id or data.captcha_text:
-        # Partial CAPTCHA data provided
         return {"success": False, "message": "CAPTCHA verification required"}
 
-    # 2. FIND USER
-    user = db.query(models.UserModel).filter(models.UserModel.employee_id == data.employee_id).first()
+    # 2. FIND USER (via adapter)
+    user = data_service.get_user(db, data.employee_id)
     
-    # 3. VERIFY CREDENTIALS (Only if password provided)
+    # 3. VERIFY CREDENTIALS
     if data.password:
-        if not user or not auth.verify_password(data.password, user.password):
+        if not user:
+            return {"success": False, "message": "Invalid Employee ID or Password"}
+        if not data_service.verify_password(db, data.employee_id, data.password):
             return {"success": False, "message": "Invalid Employee ID or Password"}
     elif not user:
-         return {"success": False, "message": "User not found"}
+        return {"success": False, "message": "User not found"}
 
-    # 4. GENERATE MOCK OTP
-    otp = f"{random.randint(100000, 999999)}"
-    user.otp_code = otp
-    user.otp_generated_at = datetime.now()
-    db.commit()
+    # 4. GENERATE & SEND OTP (via adapter)
+    otp = otp_service.generate_otp()
+    data_service.save_otp(db, data.employee_id, otp)
     
-    print(f"!!! MOCK OTP FOR {user.employee_id}: {otp} !!!")
-
-    return {
+    # Send OTP via email
+    email_result = await otp_service.send_otp_email(user.get("email", ""), otp, data.employee_id)
+    
+    response = {
         "success": True,
         "message": "OTP Sent",
         "requires_otp": True,
-        # In a real app, don't send OTP in response. For dev, it's helpful.
-        "dev_hint_otp": otp 
     }
+    
+    if email_result.get("fallback"):
+        response["dev_hint_otp"] = otp
+    
+    return response
+
 
 @app.post("/api/auth/verify-otp")
 async def verify_otp(data: schemas.OTPVerify, db: Session = Depends(get_db)):
-    user = db.query(models.UserModel).filter(models.UserModel.employee_id == data.employee_id).first()
+    # All OTP logic is now in data_service (via adapter)
+    result = data_service.verify_and_clear_otp(db, data.employee_id, data.otp_code)
     
-    if not user or user.otp_code != data.otp_code:
-        return {"success": False, "message": "Invalid OTP"}
+    if not result["success"]:
+        return result
     
-    # Optional: Check expiry here using user.otp_generated_at
-    
-    # Clear OTP
-    user.otp_code = None
-    db.commit()
-    
-    # Return a session token (Mocking it with the employee_id for now, or a simple uuid)
-    # In real app, create a session record.
     return {
-        "success": True, 
+        "success": True,
         "message": "Login Successful",
-        "token": f"session_{user.employee_id}", 
-        "employee_id": user.employee_id
+        "token": f"session_{result['employee_id']}",
+        "employee_id": result["employee_id"]
     }
 
 
@@ -97,23 +93,11 @@ async def verify_otp(data: schemas.OTPVerify, db: Session = Depends(get_db)):
 
 @app.get("/api/employee/{employee_id}", response_model=schemas.UserProfile)
 async def get_employee_profile(employee_id: str, db: Session = Depends(get_db)):
-    user = db.query(models.UserModel).filter(models.UserModel.employee_id == employee_id).first()
-    if not user:
+    # Get profile (via adapter)
+    profile = data_service.get_employee_profile(db, employee_id)
+    if not profile:
         raise HTTPException(status_code=404, detail="Employee not found")
-    
-    # Construct profile (mocking details since UserModel is simple)
-    # In a real app, you would join with an EmployeeModel
-    return schemas.UserProfile(
-        id=0, # Dummy integer ID to satisfy schema
-        employee_id=user.employee_id,
-        first_name=f"User",
-        last_name=user.employee_id,
-        full_name=f"User {user.employee_id}",
-        department="General Administration",
-        position="Officer",
-        email=f"{user.employee_id}@example.com",
-        status="active"
-    )
+    return schemas.UserProfile(**profile)
 
 
 # --- PAYSLIP DATA ENDPOINTS ---
@@ -125,61 +109,143 @@ async def get_payslip(
     year: int,
     db: Session = Depends(get_db)
 ):
-    # Retrieve payslip
-    payslip = (
-        db.query(models.PayslipModel)
-        .filter(
-            models.PayslipModel.employee_id == employee_id,
-            models.PayslipModel.month == month,
-            models.PayslipModel.year == year
-        )
-        .first()
-    )
-    
-    if not payslip:
+    # Get payslip (via adapter)
+    data = data_service.get_payslip(db, employee_id, month, year)
+    if not data:
         return {"success": False, "message": "No payslip found for this period"}
-        
-    # Return the stored JSON data directly
-    # The frontend expects a certain structure, which we will store in data_json
-    try:
-        raw_data = json.loads(payslip.data_json)
-        # Flatten the data for the frontend
-        data = {
-            "id": payslip.id,
-            "employee_id": payslip.employee_id,
-            "year": payslip.year,
-            "month": payslip.month,
-            "pay_period": f"{payslip.month} {payslip.year}",
-            
-            # Earnings
-            "basic_salary": raw_data.get("earnings", {}).get("Basic Pay", 0),
-            "house_rent_allowance": raw_data.get("earnings", {}).get("HRA", 0),
-            "travel_allowance": raw_data.get("earnings", {}).get("Travel", 0), # Added default
-            "medical_allowance": raw_data.get("earnings", {}).get("Medical", 0), # Added default
-            "special_allowance": raw_data.get("earnings", {}).get("Special", 0),
-            
-            # Deductions
-            "provident_fund": raw_data.get("deductions", {}).get("Provident Fund", 0),
-            "professional_tax": raw_data.get("deductions", {}).get("Professional Tax", 0),
-            "income_tax": raw_data.get("deductions", {}).get("Income Tax", 0),
-            "other_deductions": raw_data.get("deductions", {}).get("Other", 0),
-            
-            # Totals
-            "gross_salary": raw_data.get("summary", {}).get("Gross Salary", 0),
-            "total_deductions": raw_data.get("summary", {}).get("Total Deductions", 0),
-            "net_salary": raw_data.get("summary", {}).get("Net Salary", 0),
-            "status": "paid"
-        }
-    except:
-        data = {}
+    return {"success": True, "data": data}
 
-    return {
-        "success": True,
-        "data": data
-    }
+
+# --- PDF DOWNLOAD ENDPOINT ---
 
 @app.get("/api/payslips/download")
-async def download_payslip(employee_id: str, month: str, year: int):
-    # Placeholder for PDF generation
-    return {"message": "PDF Download not implemented yet"}
-
+async def download_payslip(
+    employee_id: str,
+    month: str,
+    year: int,
+    format: str = "pdf",
+    db: Session = Depends(get_db)
+):
+    from fpdf import FPDF
+    from fastapi.responses import StreamingResponse
+    import io
+    
+    # Get data (via adapter)
+    user = data_service.get_user(db, employee_id)
+    if not user:
+        return {"success": False, "message": "Employee not found"}
+    
+    raw_data = data_service.get_payslip_raw(db, employee_id, month, year)
+    if not raw_data:
+        return {"success": False, "message": f"No payslip found for {month} {year}"}
+    
+    # --- Build the PDF ---
+    pdf = FPDF()
+    pdf.add_page()
+    pdf.set_auto_page_break(auto=True, margin=15)
+    
+    # Header
+    pdf.set_font("Helvetica", "B", 16)
+    pdf.cell(0, 10, "GOVERNMENT OF SIKKIM", ln=True, align="C")
+    pdf.set_font("Helvetica", "B", 12)
+    pdf.cell(0, 8, f"PAY SLIP FOR THE MONTH OF {month} {year}", ln=True, align="C")
+    
+    pdf.set_font("Helvetica", "", 8)
+    ref_no = f"PS/{year}-{employee_id}/{month[:3]}/{year}"
+    pdf.cell(0, 6, ref_no, ln=True, align="L")
+    pdf.ln(5)
+    
+    # Employee Details
+    pdf.set_font("Helvetica", "", 10)
+    y_start = pdf.get_y()
+    pdf.cell(95, 6, f"Name:  {user.get('employee_id', '')}", ln=True)
+    pdf.cell(95, 6, f"Section:  General Administration", ln=True)
+    pdf.cell(95, 6, f"Date Of Birth:  --", ln=True)
+    
+    pdf.set_xy(110, y_start)
+    pdf.cell(90, 6, f"Designation:  Officer", ln=True)
+    pdf.set_x(110)
+    pdf.cell(90, 6, f"CPF No.  {employee_id}", ln=True)
+    pdf.ln(8)
+    
+    # Earnings & Deductions table
+    earnings = raw_data.get("earnings", {})
+    deductions = raw_data.get("deductions", {})
+    summary = raw_data.get("summary", {})
+    
+    col_w = 47.5
+    row_h = 8
+    
+    pdf.set_font("Helvetica", "B", 10)
+    pdf.cell(col_w, row_h, "EARNINGS", border=1, align="C")
+    pdf.cell(col_w, row_h, "Amount (Rs.)", border=1, align="C")
+    pdf.cell(col_w, row_h, "DEDUCTIONS", border=1, align="C")
+    pdf.cell(col_w, row_h, "Amount (Rs.)", border=1, align="C")
+    pdf.ln()
+    
+    earning_items = [
+        ("Basic Pay", earnings.get("Basic Pay", 0)),
+        ("DA", earnings.get("DA", 0)),
+        ("HRAWS", earnings.get("HRAWS", 0)),
+        ("NPA", earnings.get("NPA", 0)),
+        ("SBCA", earnings.get("SBCA", 0)),
+        ("TA", earnings.get("TA", 0)),
+    ]
+    
+    deduction_items = [
+        ("CPF State", deductions.get("CPF State", 0)),
+        ("GIS State", deductions.get("GIS State", 0)),
+        ("Professional Tax", deductions.get("Professional Tax", 0)),
+        ("Stamp Duty", deductions.get("Stamp Duty", 0)),
+        ("", ""),
+        ("", ""),
+    ]
+    
+    pdf.set_font("Helvetica", "", 10)
+    for i in range(len(earning_items)):
+        e_name, e_val = earning_items[i]
+        d_name, d_val = deduction_items[i]
+        
+        pdf.cell(col_w, row_h, f"  {e_name}", border=1)
+        pdf.cell(col_w, row_h, f"  {e_val:,.2f}" if e_val else "", border=1, align="R")
+        pdf.cell(col_w, row_h, f"  {d_name}", border=1)
+        pdf.cell(col_w, row_h, f"  {d_val:,.2f}" if d_val else "", border=1, align="R")
+        pdf.ln()
+    
+    pdf.ln(5)
+    
+    # Summary
+    pdf.set_font("Helvetica", "B", 11)
+    gross = summary.get("Gross Salary", 0)
+    total_ded = summary.get("Total Deductions", 0)
+    net = summary.get("Net Salary", 0)
+    
+    summary_x = 60
+    pdf.set_x(summary_x)
+    pdf.cell(65, row_h, "Gross Pay", border=1, align="C")
+    pdf.cell(65, row_h, f"Rs. {gross:,.2f}", border=1, align="R")
+    pdf.ln()
+    pdf.set_x(summary_x)
+    pdf.cell(65, row_h, "Total Deduction", border=1, align="C")
+    pdf.cell(65, row_h, f"Rs. {total_ded:,.2f}", border=1, align="R")
+    pdf.ln()
+    pdf.set_x(summary_x)
+    pdf.set_font("Helvetica", "B", 12)
+    pdf.cell(65, row_h, "Net Pay", border=1, align="C")
+    pdf.cell(65, row_h, f"Rs. {net:,.2f}", border=1, align="R")
+    pdf.ln()
+    
+    # Footer
+    pdf.ln(20)
+    pdf.set_font("Helvetica", "I", 10)
+    pdf.cell(0, 8, "Seal and Signature of D&DO", align="R")
+    
+    pdf_bytes = pdf.output()
+    pdf_buffer = io.BytesIO(pdf_bytes)
+    filename = f"payslip_{employee_id}_{month}_{year}.pdf"
+    
+    return StreamingResponse(
+        pdf_buffer,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f"attachment; filename={filename}"}
+    )
