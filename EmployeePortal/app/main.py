@@ -3,10 +3,10 @@ from sqlalchemy.orm import Session
 from fastapi.middleware.cors import CORSMiddleware
 from typing import List, Optional
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
 
 # Import from our modules
-from . import models, schemas, captcha, otp_service, data_service
+from . import models, schemas, captcha, otp_service, data_service, employee_code
 from .database import engine, get_db
 
 # Create Tables
@@ -35,6 +35,14 @@ async def get_captcha():
 
 @app.post("/api/auth/login")
 async def login(data: schemas.LoginRequest, db: Session = Depends(get_db)):
+    # 0. VALIDATE EMPLOYEE ID FORMAT (before anything else)
+    emp_type = employee_code.classify_employee(data.employee_id)
+    if emp_type == "UNKNOWN":
+        return {
+            "success": False,
+            "message": "Invalid Employee ID format. Please check your Employee ID and try again."
+        }
+
     # 1. CAPTCHA CHECK
     if data.captcha_id and data.captcha_text:
         if not captcha.verify_captcha(data.captcha_id, data.captcha_text):
@@ -65,6 +73,7 @@ async def login(data: schemas.LoginRequest, db: Session = Depends(get_db)):
         "success": True,
         "message": "OTP Sent",
         "requires_otp": True,
+        "employee_type": employee_code.classify_employee(data.employee_id),
     }
     
     if email_result.get("fallback"):
@@ -85,7 +94,8 @@ async def verify_otp(data: schemas.OTPVerify, db: Session = Depends(get_db)):
         "success": True,
         "message": "Login Successful",
         "token": f"session_{result['employee_id']}",
-        "employee_id": result["employee_id"]
+        "employee_id": result["employee_id"],
+        "employee_type": employee_code.classify_employee(result["employee_id"])
     }
 
 
@@ -249,3 +259,231 @@ async def download_payslip(
         media_type="application/pdf",
         headers={"Content-Disposition": f"attachment; filename={filename}"}
     )
+
+
+# --- QR CODE PAYSLIP VERIFICATION ---
+
+@app.post("/api/payslips/generate-verification-token")
+async def generate_verification_token(
+    employee_id: str,
+    month: str,
+    year: int,
+    db: Session = Depends(get_db)
+):
+    """
+    Generate a unique QR verification token for a payslip.
+    The frontend encodes this URL into the QR code on the payslip.
+    """
+    import uuid
+    
+    # Get payslip data
+    payslip_data = data_service.get_payslip(db, employee_id, month, year)
+    if not payslip_data:
+        return {"success": False, "message": "Payslip not found"}
+    
+    # Get the raw payslip record for the payslip_id
+    payslip = (
+        db.query(models.PayslipModel)
+        .filter(
+            models.PayslipModel.employee_id == employee_id,
+            models.PayslipModel.month == month,
+            models.PayslipModel.year == year
+        )
+        .first()
+    )
+    
+    # Check if token already exists for this payslip
+    existing = db.query(models.PayslipVerificationToken).filter(
+        models.PayslipVerificationToken.payslip_id == payslip.id
+    ).first()
+    
+    if existing:
+        return {
+            "success": True,
+            "token": existing.token,
+            "verification_url": f"/api/payslips/verify?token={existing.token}"
+        }
+    
+    # Generate new token
+    token = uuid.uuid4().hex
+    
+    verification = models.PayslipVerificationToken(
+        token=token,
+        employee_id=employee_id,
+        payslip_id=payslip.id,
+        employee_name=employee_id,  # Will be real name when connected to govt API
+        month=month,
+        year=year,
+        net_salary=payslip_data.get("net_salary", 0),
+        gross_salary=payslip_data.get("gross_salary", 0),
+        expires_at=datetime.utcnow() + timedelta(days=180),  # 6 months
+    )
+    db.add(verification)
+    db.commit()
+    
+    return {
+        "success": True,
+        "token": token,
+        "verification_url": f"/api/payslips/verify?token={token}"
+    }
+
+
+def _invalid_page() -> str:
+    """HTML page for invalid/tampered QR codes."""
+    return """
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>Payslip Verification - INVALID</title>
+        <style>
+            * { margin: 0; padding: 0; box-sizing: border-box; }
+            body { font-family: 'Segoe UI', Arial, sans-serif; background: #fef2f2; min-height: 100vh; display: flex; align-items: center; justify-content: center; padding: 20px; }
+            .card { background: white; border-radius: 12px; padding: 40px; max-width: 450px; width: 100%; box-shadow: 0 4px 20px rgba(0,0,0,0.1); text-align: center; border-top: 5px solid #dc2626; }
+            .icon { font-size: 64px; margin-bottom: 16px; }
+            h1 { color: #dc2626; font-size: 24px; margin-bottom: 12px; }
+            p { color: #666; line-height: 1.6; }
+            .warning { background: #fef2f2; border: 1px solid #fecaca; border-radius: 8px; padding: 16px; margin-top: 20px; color: #991b1b; font-size: 14px; }
+        </style>
+    </head>
+    <body>
+        <div class="card">
+            <div class="icon">❌</div>
+            <h1>INVALID PAYSLIP</h1>
+            <p>This payslip could not be verified. It may have been <strong>tampered with</strong> or the QR code is invalid.</p>
+            <div class="warning">
+                ⚠️ Do not accept this document as proof of income. Contact the issuing department for a genuine copy.
+            </div>
+        </div>
+    </body>
+    </html>
+    """
+
+
+@app.get("/api/payslips/verify")
+async def verify_payslip(token: str, db: Session = Depends(get_db)):
+    """
+    Public verification page — bank officers scan the QR code,
+    this page shows whether the payslip is genuine.
+    Returns an HTML page (not JSON) so it works directly in a phone browser.
+    """
+    from fastapi.responses import HTMLResponse
+    
+    # Look up the token
+    verification = db.query(models.PayslipVerificationToken).filter(
+        models.PayslipVerificationToken.token == token
+    ).first()
+    
+    if not verification:
+        # INVALID / TAMPERED
+        return HTMLResponse(content=_invalid_page(), status_code=404)
+    
+    # Check expiry
+    if verification.expires_at and datetime.utcnow() > verification.expires_at:
+        html = f"""
+        <!DOCTYPE html>
+        <html lang="en">
+        <head>
+            <meta charset="UTF-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1.0">
+            <title>Payslip Verification - EXPIRED</title>
+            <style>
+                * {{ margin: 0; padding: 0; box-sizing: border-box; }}
+                body {{ font-family: 'Segoe UI', Arial, sans-serif; background: #fefce8; min-height: 100vh; display: flex; align-items: center; justify-content: center; padding: 20px; }}
+                .card {{ background: white; border-radius: 12px; padding: 40px; max-width: 450px; width: 100%; box-shadow: 0 4px 20px rgba(0,0,0,0.1); text-align: center; border-top: 5px solid #ca8a04; }}
+                .icon {{ font-size: 64px; margin-bottom: 16px; }}
+                h1 {{ color: #ca8a04; font-size: 24px; margin-bottom: 12px; }}
+                p {{ color: #666; line-height: 1.6; }}
+                .info {{ background: #fefce8; border: 1px solid #fde68a; border-radius: 8px; padding: 16px; margin-top: 20px; color: #92400e; font-size: 14px; }}
+            </style>
+        </head>
+        <body>
+            <div class="card">
+                <div class="icon">⏳</div>
+                <h1>VERIFICATION EXPIRED</h1>
+                <p>This payslip verification token has <strong>expired</strong>. The employee needs to generate a new QR code from the portal.</p>
+                <div class="info">
+                    Expired on: {verification.expires_at.strftime("%d-%m-%Y")}<br>
+                    Employee ID: {verification.employee_id}
+                </div>
+            </div>
+        </body>
+        </html>
+        """
+        return HTMLResponse(content=html, status_code=410)
+    
+    # VALID — show verified data
+    created = verification.created_at.strftime("%d-%m-%Y") if verification.created_at else "N/A"
+    
+    html = f"""
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>Payslip Verification - VERIFIED</title>
+        <style>
+            * {{ margin: 0; padding: 0; box-sizing: border-box; }}
+            body {{ font-family: 'Segoe UI', Arial, sans-serif; background: #f0fdf4; min-height: 100vh; display: flex; align-items: center; justify-content: center; padding: 20px; }}
+            .card {{ background: white; border-radius: 12px; padding: 40px; max-width: 500px; width: 100%; box-shadow: 0 4px 20px rgba(0,0,0,0.1); border-top: 5px solid #16a34a; }}
+            .header {{ text-align: center; margin-bottom: 24px; }}
+            .icon {{ font-size: 64px; margin-bottom: 12px; }}
+            h1 {{ color: #16a34a; font-size: 22px; }}
+            h2 {{ color: #333; font-size: 16px; margin-bottom: 20px; text-align: center; }}
+            .details {{ border: 1px solid #e5e7eb; border-radius: 8px; overflow: hidden; }}
+            .row {{ display: flex; justify-content: space-between; padding: 12px 16px; border-bottom: 1px solid #f3f4f6; }}
+            .row:last-child {{ border-bottom: none; }}
+            .row:nth-child(even) {{ background: #fafafa; }}
+            .label {{ color: #666; font-size: 14px; }}
+            .value {{ color: #111; font-weight: 600; font-size: 14px; }}
+            .net-row {{ background: #f0fdf4 !important; }}
+            .net-row .value {{ color: #16a34a; font-size: 18px; }}
+            .footer {{ text-align: center; margin-top: 20px; padding-top: 16px; border-top: 1px solid #e5e7eb; }}
+            .footer p {{ color: #999; font-size: 12px; line-height: 1.6; }}
+            .badge {{ display: inline-block; background: #dcfce7; color: #166534; padding: 4px 12px; border-radius: 20px; font-size: 12px; font-weight: 600; margin-top: 8px; }}
+        </style>
+    </head>
+    <body>
+        <div class="card">
+            <div class="header">
+                <div class="icon">✅</div>
+                <h1>VERIFIED PAYSLIP</h1>
+                <span class="badge">Government of Sikkim</span>
+            </div>
+            
+            <h2>This payslip is authentic and has not been tampered with.</h2>
+            
+            <div class="details">
+                <div class="row">
+                    <span class="label">Employee ID</span>
+                    <span class="value">{verification.employee_id}</span>
+                </div>
+                <div class="row">
+                    <span class="label">Employee Name</span>
+                    <span class="value">{verification.employee_name}</span>
+                </div>
+                <div class="row">
+                    <span class="label">Pay Period</span>
+                    <span class="value">{verification.month} {verification.year}</span>
+                </div>
+                <div class="row">
+                    <span class="label">Gross Salary</span>
+                    <span class="value">₹{verification.gross_salary:,.2f}</span>
+                </div>
+                <div class="row net-row">
+                    <span class="label">Net Salary</span>
+                    <span class="value">₹{verification.net_salary:,.2f}</span>
+                </div>
+            </div>
+            
+            <div class="footer">
+                <p>Verified on: {created}<br>
+                Token: {verification.token[:8]}...{verification.token[-4:]}<br>
+                Issued by Government of Sikkim Employee Portal</p>
+            </div>
+        </div>
+    </body>
+    </html>
+    """
+    return HTMLResponse(content=html)

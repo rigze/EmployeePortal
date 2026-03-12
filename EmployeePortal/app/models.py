@@ -1,6 +1,6 @@
 from sqlalchemy import Column, Integer, String, Float, ForeignKey, DateTime, Text
 from sqlalchemy.orm import relationship
-from datetime import datetime
+from datetime import datetime, timedelta
 from .database import Base
 
 
@@ -37,3 +37,27 @@ class PayslipModel(Base):
     generated_at = Column(DateTime, default=datetime.utcnow)
     
     employee = relationship("UserModel", back_populates="payslips")
+
+
+class PayslipVerificationToken(Base):
+    """
+    QR Verification Tokens — for payslip authenticity proof.
+    When a bank scans the QR code on a printed payslip,
+    this token is used to look up and display the real data.
+    """
+    __tablename__ = "payslip_verification_tokens"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    token = Column(String(64), unique=True, index=True, nullable=False)  # UUID token
+    employee_id = Column(String(50), ForeignKey("users.employee_id"))
+    payslip_id = Column(Integer, ForeignKey("payslips.id"))
+    
+    # Snapshot of key data at time of generation (tamper-proof)
+    employee_name = Column(String(255))
+    month = Column(String(20))
+    year = Column(Integer)
+    net_salary = Column(Float)
+    gross_salary = Column(Float)
+    
+    created_at = Column(DateTime, default=datetime.utcnow)
+    expires_at = Column(DateTime)  # Token expires after 6 months
